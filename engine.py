@@ -13,12 +13,13 @@
   MAIL_TO          : 通知メール宛先(カンマ区切り)
   MIN_SCALE        : 通知する最小震度コード(既定45=震度5弱)
 """
-import json, os, sys, urllib.request, urllib.error, datetime, argparse
+import json, os, sys, urllib.request, urllib.error, datetime, argparse, html, traceback
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 FACILITIES_PATH = os.path.join(BASE, "facilities.json")
 STATE_PATH = os.path.join(BASE, "state.json")
-API_URL = "https://api.p2pquake.net/v2/history?codes=551&limit=20"
+# limit: 群発地震時に取りこぼさないよう余裕を持たせる
+API_URL = "https://api.p2pquake.net/v2/history?codes=551&limit=50"
 
 # 震度コード -> 表示名
 SCALE_NAME = {10:"震度1",20:"震度2",30:"震度3",40:"震度4",
@@ -95,10 +96,10 @@ def match_facilities(facilities, points):
 def build_payload(quake, points, matched, min_scale=45):
     eq = quake.get("earthquake", {})
     hypo = eq.get("hypocenter", {}) or {}
-    occurred = eq.get("time", "")
+    occurred = html.escape(str(eq.get("time", "")))
     max_scale = eq.get("maxScale", 0)
-    hypo_name = hypo.get("name", "不明")
-    mag = hypo.get("magnitude", "")
+    hypo_name = html.escape(str(hypo.get("name", "不明")))
+    mag = html.escape(str(hypo.get("magnitude", "")))
     has_target = len(matched) > 0
 
     subject = ("【地震通知・対象施設あり】" if has_target else "【地震通知・対象施設なし】") \
@@ -117,9 +118,9 @@ def build_payload(quake, points, matched, min_scale=45):
         lines.append(f"対象施設: {len(matched)}件")
         for m in sorted(matched, key=lambda x:-x["scale"]):
             fa = m["facility"]
-            lines.append(f"・{fa['name']}（{scale_label(m['scale'])}）")
-            lines.append(f"　　所在地: {fa['pref']}{fa['address']}")
-            lines.append(f"　　市町村: {fa['municipality']} ／ TEL {fa['tel']}")
+            lines.append(f"・{html.escape(fa['name'])}（{scale_label(m['scale'])}）")
+            lines.append(f"　　所在地: {html.escape(fa['pref'])}{html.escape(fa['address'])}")
+            lines.append(f"　　市町村: {html.escape(fa['municipality'])} ／ TEL {html.escape(fa['tel'])}")
     else:
         lines.append("登録施設一覧との照合結果、震度5弱以上に該当する施設はありませんでした。")
     teams_text = "<br>".join(lines)
@@ -128,11 +129,11 @@ def build_payload(quake, points, matched, min_scale=45):
     rows = ""
     for m in sorted(matched, key=lambda x:-x["scale"]):
         fa = m["facility"]
-        rows += (f"<tr><td style='padding:6px;border:1px solid #ccc'>{fa['name']}</td>"
+        rows += (f"<tr><td style='padding:6px;border:1px solid #ccc'>{html.escape(fa['name'])}</td>"
                  f"<td style='padding:6px;border:1px solid #ccc;color:#c00;font-weight:bold'>{scale_label(m['scale'])}</td>"
-                 f"<td style='padding:6px;border:1px solid #ccc'>{fa['municipality']}</td>"
-                 f"<td style='padding:6px;border:1px solid #ccc'>{fa['pref']}{fa['address']}</td>"
-                 f"<td style='padding:6px;border:1px solid #ccc'>{fa['tel']}</td></tr>")
+                 f"<td style='padding:6px;border:1px solid #ccc'>{html.escape(fa['municipality'])}</td>"
+                 f"<td style='padding:6px;border:1px solid #ccc'>{html.escape(fa['pref'])}{html.escape(fa['address'])}</td>"
+                 f"<td style='padding:6px;border:1px solid #ccc'>{html.escape(fa['tel'])}</td></tr>")
     banner_color = "#c0392b" if has_target else "#2c3e50"
     banner_text = "対象施設あり" if has_target else "対象施設なし"
     if has_target:
@@ -191,6 +192,29 @@ def post_webhook(payload, url, mail_to):
     with urllib.request.urlopen(req, timeout=30) as r:
         return r.status, r.read().decode("utf-8", "ignore")
 
+def notify_failure(webhook, mail_to, message):
+    """システム障害(API取得失敗・通知処理失敗)をWebhook経由でベストエフォート通知する。
+    通知自体の送信失敗は握りつぶす(呼び出し元のループを止めないため)。"""
+    if not webhook:
+        return
+    try:
+        payload = {
+            "hasTarget": False, "targetCount": 0,
+            "subject": "【地震通知システム・エラー】" + message[:80],
+            "teamsText": "⚠ 地震通知システムでエラーが発生しました。<br>" + html.escape(message),
+            "mailHtml": (
+                "<div style='font-family:sans-serif'>"
+                "<div style='background:#c0392b;color:#fff;padding:10px 14px;font-size:16px;font-weight:bold'>"
+                "地震通知システム・エラー通知</div>"
+                f"<div style='padding:12px 14px'><p>{html.escape(message)}</p>"
+                "<p style='color:#888;font-size:12px'>GitHub Actionsの実行ログを確認してください。</p>"
+                "</div></div>"),
+            "hypocenter": "", "maxScale": "", "occurredAt": "", "quakeId": "",
+        }
+        post_webhook(payload, webhook, mail_to)
+    except Exception:
+        pass
+
 # ---------- メイン ----------
 JST = datetime.timezone(datetime.timedelta(hours=9))
 
@@ -212,29 +236,44 @@ def run(dry_run=False):
     # ハートビート: 1日1回state.jsonを変化させ、リポジトリを常にアクティブに保つ
     # (GitHubは60日間リポジトリ更新がないとスケジュール実行を無効化するため)
     state["heartbeat"] = datetime.datetime.now(JST).date().isoformat()
-    quakes = fetch_quakes()
+    try:
+        quakes = fetch_quakes()
+    except Exception as e:
+        print(f"地震情報の取得に失敗しました: {e}", file=sys.stderr)
+        traceback.print_exc()
+        notify_failure(webhook, mail_to, f"地震情報APIの取得に失敗しました: {e}")
+        save_state(state)
+        return []
     handled = []
     for q in quakes:
-        eq = q.get("earthquake", {})
-        if not isinstance(eq.get("maxScale"), int) or eq["maxScale"] < min_scale:
-            continue
         qid = q.get("id", "")
-        if qid in state["notified"]:
+        try:
+            eq = q.get("earthquake", {})
+            if not isinstance(eq.get("maxScale"), int) or eq["maxScale"] < min_scale:
+                continue
+            if qid in state["notified"]:
+                continue
+            if quake_age_minutes(eq) > max_age:
+                state["notified"][qid] = {"at": datetime.datetime.now().isoformat(timespec="seconds"), "skipped": "old"}
+                continue
+            points = strong_points(q, min_scale)
+            matched = match_facilities(facilities, points)
+            payload = build_payload(q, points, matched, min_scale)
+            if dry_run or not webhook:
+                print("=== DRY-RUN ==="); print(payload["subject"]); print(payload["teamsText"])
+            else:
+                status, resp = post_webhook(payload, webhook, mail_to)
+                print(f"通知送信 status={status} quake={qid}")
+            state["notified"][qid] = {"at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "hasTarget": payload["hasTarget"], "targetCount": payload["targetCount"]}
+            handled.append(qid)
+        except Exception as e:
+            # 1件の失敗で他の地震の通知がブロックされないよう、ここで打ち切らず次に進む。
+            # notifiedに記録しないため、次回実行時にこの地震は再試行される。
+            print(f"地震ID={qid} の処理中にエラーが発生しました: {e}", file=sys.stderr)
+            traceback.print_exc()
+            notify_failure(webhook, mail_to, f"地震通知処理でエラーが発生しました(id={qid}): {e}")
             continue
-        if quake_age_minutes(eq) > max_age:
-            state["notified"][qid] = {"at": datetime.datetime.now().isoformat(timespec="seconds"), "skipped": "old"}
-            continue
-        points = strong_points(q, min_scale)
-        matched = match_facilities(facilities, points)
-        payload = build_payload(q, points, matched, min_scale)
-        if dry_run or not webhook:
-            print("=== DRY-RUN ==="); print(payload["subject"]); print(payload["teamsText"])
-        else:
-            status, resp = post_webhook(payload, webhook, mail_to)
-            print(f"通知送信 status={status} quake={qid}")
-        state["notified"][qid] = {"at": datetime.datetime.now().isoformat(timespec="seconds"),
-            "hasTarget": payload["hasTarget"], "targetCount": payload["targetCount"]}
-        handled.append(qid)
     if len(state["notified"]) > 200:
         items = sorted(state["notified"].items(), key=lambda kv: kv[1].get("at",""))
         state["notified"] = dict(items[-200:])
