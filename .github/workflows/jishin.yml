@@ -1,0 +1,58 @@
+name: 地震自動通知
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"     # 5分ごとに自動チェック(GitHubの最短間隔)
+  workflow_dispatch:          # 画面から手動実行できる(テスト用)
+    inputs:
+      mode:
+        description: "実行モード"
+        type: choice
+        default: "normal"
+        options:
+          - normal            # 通常チェック
+          - test              # テスト通知を1回送る(対象あり/なしの2通)
+
+permissions:
+  contents: write             # state.json(重複防止の記録)を保存するため
+
+concurrency:
+  group: jishin-notify
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: リポジトリを取得
+        uses: actions/checkout@v4
+
+      - name: Python を準備
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 地震チェック / 通知
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MIN_SCALE: "45"     # 45=震度5弱以上で通知
+        run: |
+          if [ "${{ github.event.inputs.mode }}" = "test" ]; then
+            python engine.py --test
+          else
+            python engine.py
+          fi
+
+      - name: 重複防止の記録を保存
+        if: ${{ github.event.inputs.mode != 'test' }}
+        run: |
+          if ! git diff --quiet -- state.json; then
+            git config user.name "jishin-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add state.json
+            git commit -m "update state (通知記録の更新)"
+            git push
+          else
+            echo "状態の変化なし(コミット不要)"
+          fi
