@@ -209,6 +209,9 @@ def run(dry_run=False):
     mail_to = os.environ.get("MAIL_TO", "")
     facilities = load_facilities()
     state = load_state()
+    # ハートビート: 1日1回state.jsonを変化させ、リポジトリを常にアクティブに保つ
+    # (GitHubは60日間リポジトリ更新がないとスケジュール実行を無効化するため)
+    state["heartbeat"] = datetime.datetime.now(JST).date().isoformat()
     quakes = fetch_quakes()
     handled = []
     for q in quakes:
