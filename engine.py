@@ -101,15 +101,10 @@ def build_payload(quake, points, matched, min_scale=45):
     mag = hypo.get("magnitude", "")
     has_target = len(matched) > 0
 
-    # 通知震度エリアの要約(県+市区町村っぽい部分)
-    area_summary = {}
-    for p in points:
-        area_summary.setdefault(p["pref"], set()).add(p["addr"])
-
     subject = ("【地震通知・対象施設あり】" if has_target else "【地震通知・対象施設なし】") \
               + f"{scale_label(max_scale)} {hypo_name}（{occurred}）"
 
-    # Teams / アプリ用プレーンテキスト
+    # Teams用テキスト(HTML描画のため改行は<br>)
     lines = []
     if has_target:
         lines.append("■ 震度5弱以上の地震が発生しました。【対象施設があります】")
@@ -123,11 +118,11 @@ def build_payload(quake, points, matched, min_scale=45):
         for m in sorted(matched, key=lambda x:-x["scale"]):
             fa = m["facility"]
             lines.append(f"・{fa['name']}（{scale_label(m['scale'])}）")
-            lines.append(f"    所在地: {fa['pref']}{fa['address']}")
-            lines.append(f"    市町村: {fa['municipality']} ／ TEL {fa['tel']}")
+            lines.append(f"　　所在地: {fa['pref']}{fa['address']}")
+            lines.append(f"　　市町村: {fa['municipality']} ／ TEL {fa['tel']}")
     else:
         lines.append("登録施設一覧との照合結果、震度5弱以上に該当する施設はありませんでした。")
-    teams_text = "\n".join(lines)
+    teams_text = "<br>".join(lines)
 
     # メール用HTML
     rows = ""
@@ -165,7 +160,7 @@ def build_payload(quake, points, matched, min_scale=45):
         f"（震度5弱以上を検知した際に自動送信）</p>"
         f"</div></div>")
 
-    payload = {
+    return {
         "hasTarget": has_target,
         "targetCount": len(matched),
         "subject": subject,
@@ -176,15 +171,23 @@ def build_payload(quake, points, matched, min_scale=45):
         "occurredAt": occurred,
         "quakeId": quake.get("id",""),
     }
-    return payload
 
 # ---------- Webhook送信 ----------
+def normalize_mail_to(mail_to):
+    """宛先の区切りをOutlook(V2)が確実に解釈できるセミコロン区切りに正規化。"""
+    s = (mail_to or "").replace("、", ",").replace("；", ";").replace("，", ",")
+    parts = []
+    for chunk in s.replace(",", ";").replace("\n", ";").split(";"):
+        a = chunk.strip()
+        if a:
+            parts.append(a)
+    return ";".join(parts)
+
 def post_webhook(payload, url, mail_to):
     body = dict(payload)
-    body["mailTo"] = mail_to
+    body["mailTo"] = normalize_mail_to(mail_to)
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=data,
-                                 headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return r.status, r.read().decode("utf-8", "ignore")
 
@@ -192,7 +195,6 @@ def post_webhook(payload, url, mail_to):
 JST = datetime.timezone(datetime.timedelta(hours=9))
 
 def quake_age_minutes(eq):
-    """地震発生からの経過分。時刻が読めない場合は0を返す(=新しい扱い)。"""
     t = eq.get("time", "")
     try:
         dt = datetime.datetime.strptime(t, "%Y/%m/%d %H:%M:%S").replace(tzinfo=JST)
@@ -202,7 +204,7 @@ def quake_age_minutes(eq):
 
 def run(dry_run=False):
     min_scale = int(os.environ.get("MIN_SCALE", "45"))
-    max_age = float(os.environ.get("MAX_AGE_MIN", "60"))  # これより古い地震は通知しない
+    max_age = float(os.environ.get("MAX_AGE_MIN", "60"))
     webhook = os.environ.get("WEBHOOK_URL", "")
     mail_to = os.environ.get("MAIL_TO", "")
     facilities = load_facilities()
@@ -215,29 +217,21 @@ def run(dry_run=False):
             continue
         qid = q.get("id", "")
         if qid in state["notified"]:
-            continue  # 重複防止
+            continue
         if quake_age_minutes(eq) > max_age:
-            # 古い地震(初回起動時の蒸し返し等)は記録だけして通知しない
-            state["notified"][qid] = {"at": datetime.datetime.now().isoformat(timespec="seconds"),
-                                      "skipped": "old"}
+            state["notified"][qid] = {"at": datetime.datetime.now().isoformat(timespec="seconds"), "skipped": "old"}
             continue
         points = strong_points(q, min_scale)
         matched = match_facilities(facilities, points)
         payload = build_payload(q, points, matched, min_scale)
         if dry_run or not webhook:
-            print("=== DRY-RUN 通知内容 ===")
-            print(payload["subject"])
-            print(payload["teamsText"])
+            print("=== DRY-RUN ==="); print(payload["subject"]); print(payload["teamsText"])
         else:
             status, resp = post_webhook(payload, webhook, mail_to)
             print(f"通知送信 status={status} quake={qid}")
-        state["notified"][qid] = {
-            "at": datetime.datetime.now().isoformat(timespec="seconds"),
-            "hasTarget": payload["hasTarget"],
-            "targetCount": payload["targetCount"],
-        }
+        state["notified"][qid] = {"at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "hasTarget": payload["hasTarget"], "targetCount": payload["targetCount"]}
         handled.append(qid)
-    # 状態のクリーンアップ(古い記録を200件までに)
     if len(state["notified"]) > 200:
         items = sorted(state["notified"].items(), key=lambda kv: kv[1].get("at",""))
         state["notified"] = dict(items[-200:])
@@ -247,41 +241,29 @@ def run(dry_run=False):
     return handled
 
 def send_test_notification():
-    """セットアップ確認用のテスト通知(対象施設あり/なしの2通)を実際に送信する。
-    地震APIには接続せず、ダミーの地震で通知経路(Webhook->Teams/メール)だけを確認する。"""
     webhook = os.environ.get("WEBHOOK_URL", "")
     mail_to = os.environ.get("MAIL_TO", "")
     if not webhook:
-        print("WEBHOOK_URL が未設定です。テスト送信できません。")
-        return
+        print("WEBHOOK_URL が未設定です。"); return
     facilities = load_facilities()
     now = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-
-    # 1) 対象施設あり(ダミー: 水戸市が震度6弱)
-    q1 = {"id": "TEST-HIT", "earthquake": {"time": now, "maxScale": 50,
-          "hypocenter": {"name": "【テスト】茨城県沖", "magnitude": 6.4}}}
+    q1 = {"id": "TEST-HIT", "earthquake": {"time": now, "maxScale": 50, "hypocenter": {"name": "【テスト】茨城県沖", "magnitude": 6.4}}}
     pts1 = [{"pref": "茨城県", "addr": "水戸市中央", "scale": 50}]
-    m1 = match_facilities(facilities, pts1)
-    p1 = build_payload(q1, pts1, m1)
+    p1 = build_payload(q1, pts1, match_facilities(facilities, pts1))
     p1["subject"] = "【テスト送信】" + p1["subject"]
     s1, _ = post_webhook(p1, webhook, mail_to)
     print(f"テスト通知(対象あり) 送信 status={s1} 対象{p1['targetCount']}件")
-
-    # 2) 対象施設なし(ダミー: 施設のない地域)
-    q2 = {"id": "TEST-NONE", "earthquake": {"time": now, "maxScale": 45,
-          "hypocenter": {"name": "【テスト】山梨県東部・富士五湖", "magnitude": 5.5}}}
+    q2 = {"id": "TEST-NONE", "earthquake": {"time": now, "maxScale": 45, "hypocenter": {"name": "【テスト】山梨県東部・富士五湖", "magnitude": 5.5}}}
     pts2 = [{"pref": "山梨県", "addr": "富士河口湖町長浜", "scale": 45}]
-    m2 = match_facilities(facilities, pts2)
-    p2 = build_payload(q2, pts2, m2)
+    p2 = build_payload(q2, pts2, match_facilities(facilities, pts2))
     p2["subject"] = "【テスト送信】" + p2["subject"]
     s2, _ = post_webhook(p2, webhook, mail_to)
     print(f"テスト通知(対象なし) 送信 status={s2}")
 
-
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true", help="送信せず内容を表示")
-    ap.add_argument("--test", action="store_true", help="ダミーのテスト通知を実際に送信")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--test", action="store_true")
     args = ap.parse_args()
     if args.test:
         send_test_notification()
