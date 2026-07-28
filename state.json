@@ -34,6 +34,11 @@
    "at": "2026-07-28T07:40:38",
    "hasTarget": true,
    "targetCount": 19
+  },
+  "6a6863e0e88ee598246beeee": {
+   "at": "2026-07-28T08:10:35",
+   "hasTarget": false,
+   "targetCount": 0
   }
  },
  "heartbeat": "2026-07-28"
