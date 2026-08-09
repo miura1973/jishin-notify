@@ -21,6 +21,10 @@ STATE_PATH = os.path.join(BASE, "state.json")
 # limit: 群発地震時に取りこぼさないよう余裕を持たせる
 API_URL = "https://api.p2pquake.net/v2/history?codes=551&limit=50"
 
+# Notify only on reports carrying municipality-level intensity points.
+# One earthquake yields several reports (different ids); dedupe by occurrence time.
+NOTIFY_ISSUE_TYPES = ("DetailScale", "ScaleAndDestination")
+
 # 震度コード -> 表示名
 SCALE_NAME = {10:"震度1",20:"震度2",30:"震度3",40:"震度4",
               45:"震度5弱",46:"震度5強",50:"震度6弱",55:"震度6強",60:"震度7"}
@@ -249,12 +253,16 @@ def run(dry_run=False):
         qid = q.get("id", "")
         try:
             eq = q.get("earthquake", {})
+            issue_type = (q.get("issue", {}) or {}).get("type", "")
+            if issue_type not in NOTIFY_ISSUE_TYPES:
+                continue
             if not isinstance(eq.get("maxScale"), int) or eq["maxScale"] < min_scale:
                 continue
-            if qid in state["notified"]:
+            eqkey = eq.get("time", "") or qid
+            if eqkey in state["notified"]:
                 continue
             if quake_age_minutes(eq) > max_age:
-                state["notified"][qid] = {"at": datetime.datetime.now().isoformat(timespec="seconds"), "skipped": "old"}
+                state["notified"][eqkey] = {"at": datetime.datetime.now().isoformat(timespec="seconds"), "skipped": "old"}
                 continue
             points = strong_points(q, min_scale)
             matched = match_facilities(facilities, points)
@@ -263,10 +271,10 @@ def run(dry_run=False):
                 print("=== DRY-RUN ==="); print(payload["subject"]); print(payload["teamsText"])
             else:
                 status, resp = post_webhook(payload, webhook, mail_to)
-                print(f"通知送信 status={status} quake={qid}")
-            state["notified"][qid] = {"at": datetime.datetime.now().isoformat(timespec="seconds"),
+                print(f"通知送信 status={status} quake={eqkey}")
+            state["notified"][eqkey] = {"at": datetime.datetime.now().isoformat(timespec="seconds"),
                 "hasTarget": payload["hasTarget"], "targetCount": payload["targetCount"]}
-            handled.append(qid)
+            handled.append(eqkey)
         except Exception as e:
             # 1件の失敗で他の地震の通知がブロックされないよう、ここで打ち切らず次に進む。
             # notifiedに記録しないため、次回実行時にこの地震は再試行される。
