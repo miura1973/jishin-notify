@@ -13,7 +13,7 @@
   MAIL_TO          : 通知メール宛先(カンマ区切り)
   MIN_SCALE        : 通知する最小震度コード(既定45=震度5弱)
 """
-import json, os, sys, urllib.request, urllib.error, datetime, argparse, html, traceback
+import json, os, sys, time, urllib.request, urllib.error, datetime, argparse, html, traceback
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 FACILITIES_PATH = os.path.join(BASE, "facilities.json")
@@ -33,10 +33,21 @@ def scale_label(s):
     return SCALE_NAME.get(s, f"震度コード{s}")
 
 # ---------- データ取得 ----------
-def fetch_quakes(url=API_URL):
-    req = urllib.request.Request(url, headers={"User-Agent": "jishin-notify/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r)
+def fetch_quakes(url=API_URL, attempts=3):
+    """API側(Cloudflare)の一時障害(522/525等)は数秒〜数分で復旧することが多いため、
+    間隔を空けて数回やり直す。すべて失敗した場合のみ例外を投げる。"""
+    last_error = None
+    for i in range(attempts):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "jishin-notify/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.load(r)
+        except Exception as e:
+            last_error = e
+            print(f"API取得に失敗({i+1}/{attempts}): {e}", file=sys.stderr)
+            if i < attempts - 1:
+                time.sleep(3 * (i + 1))
+    raise last_error
 
 # ---------- 施設マスタ ----------
 def load_facilities(path=FACILITIES_PATH):
@@ -219,6 +230,31 @@ def notify_failure(webhook, mail_to, message):
     except Exception:
         pass
 
+def notify_recovery(webhook, mail_to, first_at, last_error):
+    """API障害からの復旧を通知する(障害を通知していた場合のみ呼ばれる)。"""
+    if not webhook:
+        return
+    try:
+        since = f"（障害の始まり: {first_at}）" if first_at else ""
+        msg = f"地震情報APIの取得が復旧しました。{since}"
+        payload = {
+            "hasTarget": False, "targetCount": 0,
+            "subject": "【地震通知システム・復旧】地震情報APIの取得が復旧しました",
+            "teamsText": "✅ 地震通知システムは正常に復旧しました。<br>" + html.escape(msg),
+            "mailHtml": (
+                "<div style='font-family:sans-serif'>"
+                "<div style='background:#1e8449;color:#fff;padding:10px 14px;font-size:16px;font-weight:bold'>"
+                "地震通知システム・復旧通知</div>"
+                f"<div style='padding:12px 14px'><p>{html.escape(msg)}</p>"
+                "<p style='color:#888;font-size:12px'>過去60分の地震をさかのぼって照合するため、"
+                "短時間の障害であればこの間の地震も改めて確認されます。</p>"
+                "</div></div>"),
+            "hypocenter": "", "maxScale": "", "occurredAt": "", "quakeId": "",
+        }
+        post_webhook(payload, webhook, mail_to)
+    except Exception:
+        pass
+
 # ---------- メイン ----------
 JST = datetime.timezone(datetime.timedelta(hours=9))
 
@@ -233,6 +269,8 @@ def quake_age_minutes(eq):
 def run(dry_run=False):
     min_scale = int(os.environ.get("MIN_SCALE", "45"))
     max_age = float(os.environ.get("MAX_AGE_MIN", "60"))
+    # 連続で何回失敗したらエラー通知を出すか(既定3回=約15分間の継続障害)
+    fail_notify_after = int(os.environ.get("FAIL_NOTIFY_AFTER", "3"))
     webhook = os.environ.get("WEBHOOK_URL", "")
     mail_to = os.environ.get("MAIL_TO", "")
     facilities = load_facilities()
@@ -245,9 +283,24 @@ def run(dry_run=False):
     except Exception as e:
         print(f"地震情報の取得に失敗しました: {e}", file=sys.stderr)
         traceback.print_exc()
-        notify_failure(webhook, mail_to, f"地震情報APIの取得に失敗しました: {e}")
+        fail = state.get("fail") or {}
+        fail["consecutive"] = int(fail.get("consecutive", 0)) + 1
+        fail["last_error"] = str(e)
+        if not fail.get("first_at"):
+            fail["first_at"] = datetime.datetime.now(JST).isoformat(timespec="seconds")
+        if fail["consecutive"] >= fail_notify_after and not fail.get("notified"):
+            notify_failure(webhook, mail_to,
+                           f"地震情報APIの取得に{fail['consecutive']}回連続で失敗しました: {e}")
+            fail["notified"] = True
+        state["fail"] = fail
         save_state(state)
         return []
+    # 取得成功。障害を通知済みだった場合は復旧を知らせ、失敗の記録を消す。
+    prev_fail = state.get("fail") or {}
+    if prev_fail.get("notified"):
+        notify_recovery(webhook, mail_to, prev_fail.get("first_at", ""), prev_fail.get("last_error", ""))
+    if prev_fail:
+        state["fail"] = {}
     handled = []
     for q in quakes:
         qid = q.get("id", "")
