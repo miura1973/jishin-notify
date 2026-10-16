@@ -92,9 +92,5 @@
   }
  },
  "heartbeat": "2026-10-16",
- "fail": {
-  "consecutive": 1,
-  "last_error": "HTTP Error 525: <none>",
-  "first_at": "2026-10-16T12:46:13+09:00"
- }
+ "fail": {}
 }
