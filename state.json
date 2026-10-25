@@ -92,9 +92,5 @@
   }
  },
  "heartbeat": "2026-10-25",
- "fail": {
-  "consecutive": 1,
-  "last_error": "HTTP Error 522: <none>",
-  "first_at": "2026-10-25T19:16:37+09:00"
- }
+ "fail": {}
 }
