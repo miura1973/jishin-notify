@@ -102,9 +102,5 @@
   }
  },
  "heartbeat": "2026-11-08",
- "fail": {
-  "consecutive": 1,
-  "last_error": "The read operation timed out",
-  "first_at": "2026-11-08T01:27:02+09:00"
- }
+ "fail": {}
 }
